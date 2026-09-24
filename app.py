@@ -189,11 +189,13 @@ def split_caption_word_groups(
     return groups
 
 
-def extend_short_tile_durations(entries, max_chars: int) -> None:
+def extend_short_tile_durations(entries, max_chars: int, pause_seconds: float) -> None:
     """Give short text a little more reading time when a real pause permits it."""
     short_tile_limit = max(4, max_chars // 3)
     for index, (start, end, text) in enumerate(entries):
         if len(text) > short_tile_limit:
+            continue
+        if index + 1 < len(entries) and entries[index + 1][0] - end >= pause_seconds:
             continue
         next_start = entries[index + 1][0] if index + 1 < len(entries) else end + SHORT_TILE_MAX_DURATION_EXTENSION
         available_end = next_start - 0.01
@@ -202,9 +204,11 @@ def extend_short_tile_durations(entries, max_chars: int) -> None:
             entries[index] = (start, extended_end, text)
 
 
-def extend_all_tile_durations(entries, extension_seconds: float) -> None:
+def extend_all_tile_durations(entries, extension_seconds: float, pause_seconds: float) -> None:
     """Extend every tile into the available gap without moving its start."""
     for index, (start, end, text) in enumerate(entries):
+        if index + 1 < len(entries) and entries[index + 1][0] - end >= pause_seconds:
+            continue
         next_start = entries[index + 1][0] if index + 1 < len(entries) else end + extension_seconds
         extended_end = min(end + extension_seconds, next_start - 0.01)
         if extended_end > end:
@@ -235,8 +239,8 @@ def write_srt(
             if text:
                 entries.append((group[0].start, group[-1].end, text))
 
-    extend_short_tile_durations(entries, max_chars)
-    extend_all_tile_durations(entries, tile_extension_seconds)
+    extend_short_tile_durations(entries, max_chars, pause_seconds)
+    extend_all_tile_durations(entries, tile_extension_seconds, pause_seconds)
     with destination.open("w", encoding="utf-8-sig", newline="\n") as file:
         for index, (start, end, text) in enumerate(entries, start=1):
             file.write(f"{index}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n\n")
