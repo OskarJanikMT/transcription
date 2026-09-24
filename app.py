@@ -20,6 +20,17 @@ MEDIA_TYPES = (
 MODELS = ("tiny", "base", "small", "medium", "large-v3")
 CUDA_DLL_DIRECTORIES = []
 LONG_WORD_PAUSE_SECONDS = 0.65
+SHORT_TILE_MAX_DURATION_EXTENSION = 0.25
+NUMBER_PATTERN = re.compile(r"^[+-]?\d+(?:[.,]\d+)?(?:%|°)?[.)]?$")
+UNIT_WORDS = frozenset(
+    {
+        "g", "kg", "mg", "t", "l", "ml", "dl", "m", "cm", "mm", "km",
+        "m2", "m3", "w", "kw", "mw", "v", "a", "mah", "ah", "wh", "kwh",
+        "hz", "mb", "gb", "tb", "ms", "s", "min", "h", "zł", "pln",
+        "eur", "usd", "procent", "procentów", "stopni", "lat", "roku",
+        "lata", "dni", "dzień", "godzin",
+    }
+)
 CONNECTOR_WORDS = frozenset(
     {
         "a", "aby", "ale", "ani", "bez", "bo", "by", "być", "czy", "dla",
@@ -73,52 +84,92 @@ def is_connector(word: str) -> bool:
     return re.sub(r"[^a-ząćęłńóśźż]+$", "", word.lower()) in CONNECTOR_WORDS
 
 
-def split_balanced_group(words, target_words: int) -> list[list]:
-    """Balance a phrase around the target size without separating connectors."""
-    if len(words) <= target_words:
+def is_number(word: str) -> bool:
+    """Recognize numbers emitted by the transcription."""
+    return bool(NUMBER_PATTERN.fullmatch(word.strip()))
+
+
+def is_unit(word: str) -> bool:
+    """Recognize a common unit that must remain with its number."""
+    normalized = re.sub(r"[^a-zA-Ząćęłńóśźż]+$", "", word.lower())
+    return normalized in UNIT_WORDS
+
+
+def group_character_count(words) -> int:
+    return len(" ".join(clean_text(word.word) for word in words))
+
+
+def may_exceed_limit_for_number_and_unit(words, start: int, end: int) -> bool:
+    return end - start >= 2 and is_number(clean_text(words[end - 2].word)) and is_unit(clean_text(words[end - 1].word))
+
+
+def split_balanced_group(words, target_words: int, max_words: int, max_chars: int) -> list[list]:
+    """Balance a phrase around a soft target while respecting hard limits."""
+    if len(words) == 1:
         return [words]
 
-    group_count = (len(words) + target_words - 1) // target_words
-    ideal_size = len(words) / group_count
-    costs: dict[tuple[int, int], tuple[float, list[int]]] = {(0, 0): (0.0, [])}
+    minimum_group_count = (len(words) + max_words - 1) // max_words
+    preferred_group_count = max(minimum_group_count, (len(words) + target_words - 1) // target_words)
+    best_partition: tuple[float, list[list]] | None = None
 
-    for group_index in range(group_count):
-        for start in range(len(words)):
-            state = costs.get((group_index, start))
-            if state is None:
-                continue
-            accumulated_cost, breaks = state
-            remaining_groups = group_count - group_index - 1
-            minimum_end = start + 1
-            maximum_end = len(words) - remaining_groups
-            for end in range(minimum_end, maximum_end + 1):
-                size = end - start
-                cost = accumulated_cost + (size - ideal_size) ** 2
-                # A connector at a caption end is hard to read on screen.
-                if end < len(words) and is_connector(clean_text(words[end - 1].word)):
-                    cost += 1000
-                if size == 1 and len(words) > 1:
-                    cost += 25
-                previous = costs.get((group_index + 1, end))
-                if previous is None or cost < previous[0]:
-                    costs[(group_index + 1, end)] = (cost, breaks + [end])
+    for group_count in range(minimum_group_count, len(words) + 1):
+        if group_count > preferred_group_count and best_partition is not None:
+            break
+        ideal_size = len(words) / group_count
+        costs: dict[tuple[int, int], tuple[float, list[int]]] = {(0, 0): (0.0, [])}
 
-    break_positions = costs[(group_count, len(words))][1][:-1]
-    groups: list[list] = []
-    start = 0
-    for end in break_positions + [len(words)]:
-        groups.append(words[start:end])
-        start = end
-    return groups
+        for group_index in range(group_count):
+            for start in range(len(words)):
+                state = costs.get((group_index, start))
+                if state is None:
+                    continue
+                accumulated_cost, breaks = state
+                remaining_groups = group_count - group_index - 1
+                for end in range(start + 1, len(words) - remaining_groups + 1):
+                    size = end - start
+                    candidate_words = words[start:end]
+                    number_and_unit = may_exceed_limit_for_number_and_unit(words, start, end)
+                    if size > max_words and not number_and_unit:
+                        continue
+                    if group_character_count(candidate_words) > max_chars and size > 1 and not number_and_unit:
+                        continue
+                    cost = accumulated_cost + (size - ideal_size) ** 2
+                    if end < len(words) and is_connector(clean_text(words[end - 1].word)):
+                        cost += 1000
+                    if end < len(words) and is_number(clean_text(words[end - 1].word)) and is_unit(clean_text(words[end].word)):
+                        cost += 1000
+                    if size == 1 and len(words) > 1:
+                        cost += 25
+                    previous = costs.get((group_index + 1, end))
+                    if previous is None or cost < previous[0]:
+                        costs[(group_index + 1, end)] = (cost, breaks + [end])
+
+        final_state = costs.get((group_count, len(words)))
+        if final_state is None:
+            continue
+        break_positions = final_state[1][:-1]
+        groups: list[list] = []
+        start = 0
+        for end in break_positions + [len(words)]:
+            groups.append(words[start:end])
+            start = end
+        candidate = (final_state[0], groups)
+        if best_partition is None or candidate[0] < best_partition[0]:
+            best_partition = candidate
+
+    return best_partition[1] if best_partition else [words]
 
 
-def split_caption_word_groups(words, target_words: int) -> list[list]:
-    """Split on commas and long pauses, then balance the remaining phrases."""
+def split_caption_word_groups(words, target_words: int, max_words: int, max_chars: int) -> list[list]:
+    """Split on commas, numbers and long pauses, then balance phrases."""
     groups: list[list] = []
     phrase: list = []
     for index, word in enumerate(words):
-        phrase.append(word)
         word_text = clean_text(getattr(word, "word", ""))
+        if is_number(word_text) and phrase:
+            groups.extend(split_balanced_group(phrase, target_words, max_words, max_chars))
+            phrase = []
+        phrase.append(word)
         next_word = words[index + 1] if index + 1 < len(words) else None
         pause_after_word = (
             next_word is not None
@@ -126,27 +177,47 @@ def split_caption_word_groups(words, target_words: int) -> list[list]:
             and not is_connector(word_text)
         )
         if word_ends_with_comma(word_text) or pause_after_word:
-            groups.extend(split_balanced_group(phrase, target_words))
+            groups.extend(split_balanced_group(phrase, target_words, max_words, max_chars))
             phrase = []
     if phrase:
-        groups.extend(split_balanced_group(phrase, target_words))
+        groups.extend(split_balanced_group(phrase, target_words, max_words, max_chars))
     return groups
 
 
-def write_srt(segments, destination: Path, max_words: int = 7) -> int:
+def extend_short_tile_durations(entries, max_chars: int) -> None:
+    """Give short text a little more reading time when a real pause permits it."""
+    short_tile_limit = max(4, max_chars // 3)
+    for index, (start, end, text) in enumerate(entries):
+        if len(text) > short_tile_limit:
+            continue
+        next_start = entries[index + 1][0] if index + 1 < len(entries) else end + SHORT_TILE_MAX_DURATION_EXTENSION
+        available_end = next_start - 0.01
+        extended_end = min(end + SHORT_TILE_MAX_DURATION_EXTENSION, available_end)
+        if extended_end > end:
+            entries[index] = (start, extended_end, text)
+
+
+def write_srt(
+    segments,
+    destination: Path,
+    target_words: int = 7,
+    max_words: int = 10,
+    max_chars: int = 42,
+) -> int:
     """Create a UTF-8 SRT file from faster-whisper segments."""
     entries: list[tuple[float, float, str]] = []
     for segment in segments:
         word_timestamps = list(getattr(segment, "words", None) or [])
         if not word_timestamps:
             continue
-        for group in split_caption_word_groups(word_timestamps, max_words):
+        for group in split_caption_word_groups(word_timestamps, target_words, max_words, max_chars):
             text_words = [clean_text(word.word) for word in group]
             text_words[-1] = remove_final_comma(text_words[-1])
             text = " ".join(word for word in text_words if word)
             if text:
                 entries.append((group[0].start, group[-1].end, text))
 
+    extend_short_tile_durations(entries, max_chars)
     with destination.open("w", encoding="utf-8-sig", newline="\n") as file:
         for index, (start, end, text) in enumerate(entries, start=1):
             file.write(f"{index}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n\n")
@@ -157,14 +228,16 @@ class WhisperSrtApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Napisy do Premiere — Whisper → SRT")
-        self.geometry("720x510")
-        self.minsize(640, 470)
+        self.geometry("720x580")
+        self.minsize(640, 540)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.model_name = tk.StringVar(value="small")
         self.language = tk.StringVar(value="pl")
-        self.max_words = tk.IntVar(value=7)
+        self.target_words = tk.IntVar(value=7)
+        self.max_words = tk.IntVar(value=10)
+        self.max_chars = tk.IntVar(value=42)
         # CPU works out of the box. CUDA requires matching NVIDIA CUDA libraries.
         self.device = tk.StringVar(value="cpu")
         self.status = tk.StringVar(value="Wybierz nagranie, aby rozpocząć.")
@@ -212,19 +285,35 @@ class WhisperSrtApp(tk.Tk):
             row=6, column=2, sticky="w", padx=(12, 0), pady=4
         )
 
-        ttk.Label(frame, text="Docelowo s\u0142\u00f3w w kafelku:").grid(row=7, column=0, sticky="w", pady=4)
-        ttk.Spinbox(frame, from_=1, to=30, textvariable=self.max_words, width=14).grid(
+        ttk.Label(frame, text="Docelowo słów w kafelku:").grid(row=7, column=0, sticky="w", pady=4)
+        ttk.Spinbox(frame, from_=1, to=30, textvariable=self.target_words, width=14).grid(
             row=7, column=1, sticky="w", pady=4
         )
-        ttk.Label(frame, text="Domy\u015blnie 7; przecinek i d\u0142u\u017csza pauza tworz\u0105 nowy kafelek").grid(
+        ttk.Label(frame, text="Wskazówka do równoważenia kafelków").grid(
             row=7, column=2, sticky="w", padx=(12, 0), pady=4
         )
 
+        ttk.Label(frame, text="Maks. słów w kafelku:").grid(row=8, column=0, sticky="w", pady=4)
+        ttk.Spinbox(frame, from_=1, to=30, textvariable=self.max_words, width=14).grid(
+            row=8, column=1, sticky="w", pady=4
+        )
+        ttk.Label(frame, text="Twardy limit, z wyjątkiem liczby z jednostką").grid(
+            row=8, column=2, sticky="w", padx=(12, 0), pady=4
+        )
+
+        ttk.Label(frame, text="Maks. znaków w kafelku:").grid(row=9, column=0, sticky="w", pady=4)
+        ttk.Spinbox(frame, from_=8, to=160, textvariable=self.max_chars, width=14).grid(
+            row=9, column=1, sticky="w", pady=4
+        )
+        ttk.Label(frame, text="Krótkie kafelki dostają więcej czasu w pauzie").grid(
+            row=9, column=2, sticky="w", padx=(12, 0), pady=4
+        )
+
         self.progress = ttk.Progressbar(frame, mode="indeterminate")
-        self.progress.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(25, 8))
-        ttk.Label(frame, textvariable=self.status, wraplength=650).grid(row=9, column=0, columnspan=3, sticky="w")
+        self.progress.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(25, 8))
+        ttk.Label(frame, textvariable=self.status, wraplength=650).grid(row=11, column=0, columnspan=3, sticky="w")
         self.start_button = ttk.Button(frame, text="Generuj napisy SRT", command=self.start)
-        self.start_button.grid(row=10, column=0, columnspan=3, pady=(20, 0))
+        self.start_button.grid(row=12, column=0, columnspan=3, pady=(20, 0))
 
     @staticmethod
     def _path_row(parent, row, label, variable, command, button) -> None:
@@ -253,18 +342,31 @@ class WhisperSrtApp(tk.Tk):
             output = output.with_suffix(".srt")
             self.output_path.set(str(output))
         try:
+            target_words = self.target_words.get()
             max_words = self.max_words.get()
+            max_chars = self.max_chars.get()
         except tk.TclError:
+            target_words = 0
             max_words = 0
-        if not 1 <= max_words <= 30:
-            messagebox.showerror("Nieprawid\u0142owy limit", "Podaj liczb\u0119 od 1 do 30 docelowych s\u0142\u00f3w w kafelku.")
+            max_chars = 0
+        if not 1 <= target_words <= max_words <= 30 or not 8 <= max_chars <= 160:
+            messagebox.showerror(
+                "Nieprawidłowe ustawienia",
+                "Docelowa liczba słów musi wynosić od 1 do maksimum (do 30), a limit znaków od 8 do 160.",
+            )
             return
         self.start_button.configure(state="disabled")
         self.progress.start(12)
         self.status.set("Uruchamianie Whispera — pierwsze użycie może pobrać model…")
-        threading.Thread(target=self._transcribe, args=(source, output, max_words), daemon=True).start()
+        threading.Thread(
+            target=self._transcribe,
+            args=(source, output, target_words, max_words, max_chars),
+            daemon=True,
+        ).start()
 
-    def _transcribe(self, source: Path, output: Path, max_words: int) -> None:
+    def _transcribe(
+        self, source: Path, output: Path, target_words: int, max_words: int, max_chars: int
+    ) -> None:
         try:
             requested_device = self.device.get()
             if requested_device == "cuda":
@@ -285,7 +387,13 @@ class WhisperSrtApp(tk.Tk):
                 beam_size=5,
                 word_timestamps=True,
             )
-            count = write_srt(segments, output, max_words=max_words)
+            count = write_srt(
+                segments,
+                output,
+                target_words=target_words,
+                max_words=max_words,
+                max_chars=max_chars,
+            )
             detected = getattr(info, "language", "nieznany")
             self.events.put(("done", (count, output, detected)))
         except ImportError:
