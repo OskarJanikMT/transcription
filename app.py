@@ -179,7 +179,6 @@ def split_caption_word_groups(
         pause_after_word = (
             next_word is not None
             and next_word.start - word.end >= pause_seconds
-            and not is_connector(word_text)
         )
         if word_ends_with_comma(word_text) or pause_after_word:
             groups.extend(split_balanced_group(phrase, target_words, max_words, max_chars))
@@ -336,7 +335,7 @@ class WhisperSrtApp(tk.Tk):
 
         ttk.Label(frame, text="Pauza dzieląca kafelki (s):").grid(row=10, column=0, sticky="w", pady=4)
         ttk.Spinbox(
-            frame, from_=0.1, to=5.0, increment=0.05, textvariable=self.pause_seconds, width=14
+            frame, from_=0.01, to=5.0, increment=0.01, textvariable=self.pause_seconds, width=14
         ).grid(row=10, column=1, sticky="w", pady=4)
         ttk.Label(frame, text="Domyślnie 0,40 s; liczona między słowami").grid(
             row=10, column=2, sticky="w", padx=(12, 0), pady=4
@@ -397,12 +396,12 @@ class WhisperSrtApp(tk.Tk):
         if (
             not 1 <= target_words <= max_words <= 30
             or not 8 <= max_chars <= 160
-            or not 0.1 <= pause_seconds <= 5.0
+            or not 0.01 <= pause_seconds <= 5.0
             or not 0.0 <= tile_extension_seconds <= 5.0
         ):
             messagebox.showerror(
                 "Nieprawidłowe ustawienia",
-                "Docelowa liczba słów musi wynosić od 1 do maksimum (do 30), limit znaków od 8 do 160, a czasy od 0 do 5 s.",
+                "Docelowa liczba słów musi wynosić od 1 do maksimum (do 30), limit znaków od 8 do 160, pauza od 0,01 do 5 s, a wydłużenie od 0 do 5 s.",
             )
             return
         self.start_button.configure(state="disabled")
