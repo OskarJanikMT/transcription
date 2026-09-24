@@ -194,8 +194,6 @@ def extend_short_tile_durations(entries, max_chars: int, pause_seconds: float) -
     for index, (start, end, text) in enumerate(entries):
         if len(text) > short_tile_limit:
             continue
-        if index + 1 < len(entries) and entries[index + 1][0] - end >= pause_seconds:
-            continue
         next_start = entries[index + 1][0] if index + 1 < len(entries) else end + SHORT_TILE_MAX_DURATION_EXTENSION
         available_end = next_start - 0.01
         extended_end = min(end + SHORT_TILE_MAX_DURATION_EXTENSION, available_end)
@@ -206,8 +204,6 @@ def extend_short_tile_durations(entries, max_chars: int, pause_seconds: float) -
 def extend_all_tile_durations(entries, extension_seconds: float, pause_seconds: float) -> None:
     """Extend every tile into the available gap without moving its start."""
     for index, (start, end, text) in enumerate(entries):
-        if index + 1 < len(entries) and entries[index + 1][0] - end >= pause_seconds:
-            continue
         next_start = entries[index + 1][0] if index + 1 < len(entries) else end + extension_seconds
         extended_end = min(end + extension_seconds, next_start - 0.01)
         if extended_end > end:
