@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import os
+import re
 import sys
 import threading
 import traceback
@@ -48,48 +49,44 @@ def clean_text(text: str) -> str:
     return " ".join(text.strip().split())
 
 
-def split_caption_parts(text: str, max_words: int) -> list[str]:
-    """Split a caption into timed parts, preferring commas as hidden breaks."""
-    words = text.split()
-    parts: list[str] = []
-    while words:
-        line_length = min(max_words, len(words))
-        comma_positions = [
-            index for index, word in enumerate(words[:line_length]) if word.endswith(",")
-        ]
-        # Do not create an awkward one-word line solely because a comma
-        # appeared at its beginning; otherwise use the last fitting comma.
-        minimum_natural_line = min(len(words), max(2, (max_words + 1) // 2))
-        comma_positions = [index for index in comma_positions if index + 1 >= minimum_natural_line]
-        if comma_positions:
-            line_length = comma_positions[-1] + 1
-        line_words = words[:line_length]
-        if line_words[-1].endswith(","):
-            line_words[-1] = line_words[-1].rstrip(",")
-        part = " ".join(line_words)
-        if part:
-            parts.append(part)
-        words = words[line_length:]
-    return parts
+def word_ends_with_comma(word: str) -> bool:
+    """Return whether a word finishes with a comma, before closing quotes."""
+    return bool(re.search(r",(?=[\"'”’»)\]]*$)", word))
+
+
+def remove_final_comma(word: str) -> str:
+    """Hide the comma which has been used as a subtitle boundary."""
+    return re.sub(r",(?=[\"'”’»)\]]*$)", "", word)
+
+
+def split_caption_word_groups(words, max_words: int) -> list[list]:
+    """Split after every comma and at the configured maximum word count."""
+    groups: list[list] = []
+    current_group: list = []
+    for word in words:
+        current_group.append(word)
+        word_text = clean_text(getattr(word, "word", ""))
+        if word_ends_with_comma(word_text) or len(current_group) >= max_words:
+            groups.append(current_group)
+            current_group = []
+    if current_group:
+        groups.append(current_group)
+    return groups
 
 
 def write_srt(segments, destination: Path, max_words: int = 7) -> int:
     """Create a UTF-8 SRT file from faster-whisper segments."""
     entries: list[tuple[float, float, str]] = []
     for segment in segments:
-        text = clean_text(segment.text)
-        if not text:
+        word_timestamps = list(getattr(segment, "words", None) or [])
+        if not word_timestamps:
             continue
-        parts = split_caption_parts(text, max_words)
-        total_words = sum(len(part.split()) for part in parts)
-        words_before_part = 0
-        duration = segment.end - segment.start
-        for index, part in enumerate(parts):
-            part_words = len(part.split())
-            start = segment.start + duration * words_before_part / total_words
-            words_before_part += part_words
-            end = segment.end if index == len(parts) - 1 else segment.start + duration * words_before_part / total_words
-            entries.append((start, end, part))
+        for group in split_caption_word_groups(word_timestamps, max_words):
+            text_words = [clean_text(word.word) for word in group]
+            text_words[-1] = remove_final_comma(text_words[-1])
+            text = " ".join(word for word in text_words if word)
+            if text:
+                entries.append((group[0].start, group[-1].end, text))
 
     with destination.open("w", encoding="utf-8-sig", newline="\n") as file:
         for index, (start, end, text) in enumerate(entries, start=1):
@@ -222,7 +219,13 @@ class WhisperSrtApp(tk.Tk):
             model = WhisperModel(self.model_name.get(), device=device, compute_type=compute_type)
             language = None if self.language.get() == "auto" else self.language.get()
             self.events.put(("status", "Transkrypcja w toku…"))
-            segments, info = model.transcribe(str(source), language=language, vad_filter=True, beam_size=5)
+            segments, info = model.transcribe(
+                str(source),
+                language=language,
+                vad_filter=True,
+                beam_size=5,
+                word_timestamps=True,
+            )
             count = write_srt(segments, output, max_words=max_words)
             detected = getattr(info, "language", "nieznany")
             self.events.put(("done", (count, output, detected)))
