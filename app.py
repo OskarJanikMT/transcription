@@ -443,7 +443,9 @@ class WhisperSrtApp(tk.Tk):
             segments, info = model.transcribe(
                 str(source),
                 language=language,
-                vad_filter=True,
+                # Word-level timings are more stable when the model sees the
+                # full audio timeline instead of VAD-cut speech fragments.
+                vad_filter=False,
                 beam_size=5,
                 word_timestamps=True,
             )
