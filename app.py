@@ -19,6 +19,15 @@ MEDIA_TYPES = (
 )
 MODELS = ("tiny", "base", "small", "medium", "large-v3")
 CUDA_DLL_DIRECTORIES = []
+LONG_WORD_PAUSE_SECONDS = 0.65
+CONNECTOR_WORDS = frozenset(
+    {
+        "a", "aby", "ale", "ani", "bez", "bo", "by", "być", "czy", "dla",
+        "do", "gdy", "i", "jak", "jeśli", "lecz", "lub", "na", "nad", "nie",
+        "o", "od", "oraz", "po", "pod", "ponad", "przez", "u", "w", "we",
+        "więc", "z", "za", "ze", "że",
+    }
+)
 
 
 def enable_cuda_libraries() -> None:
@@ -59,18 +68,68 @@ def remove_final_comma(word: str) -> str:
     return re.sub(r",(?=[\"'”’»)\]]*$)", "", word)
 
 
-def split_caption_word_groups(words, max_words: int) -> list[list]:
-    """Split after every comma and at the configured maximum word count."""
+def is_connector(word: str) -> bool:
+    """Whether a word should stay with the word which follows it."""
+    return re.sub(r"[^a-ząćęłńóśźż]+$", "", word.lower()) in CONNECTOR_WORDS
+
+
+def split_balanced_group(words, target_words: int) -> list[list]:
+    """Balance a phrase around the target size without separating connectors."""
+    if len(words) <= target_words:
+        return [words]
+
+    group_count = (len(words) + target_words - 1) // target_words
+    ideal_size = len(words) / group_count
+    costs: dict[tuple[int, int], tuple[float, list[int]]] = {(0, 0): (0.0, [])}
+
+    for group_index in range(group_count):
+        for start in range(len(words)):
+            state = costs.get((group_index, start))
+            if state is None:
+                continue
+            accumulated_cost, breaks = state
+            remaining_groups = group_count - group_index - 1
+            minimum_end = start + 1
+            maximum_end = len(words) - remaining_groups
+            for end in range(minimum_end, maximum_end + 1):
+                size = end - start
+                cost = accumulated_cost + (size - ideal_size) ** 2
+                # A connector at a caption end is hard to read on screen.
+                if end < len(words) and is_connector(clean_text(words[end - 1].word)):
+                    cost += 1000
+                if size == 1 and len(words) > 1:
+                    cost += 25
+                previous = costs.get((group_index + 1, end))
+                if previous is None or cost < previous[0]:
+                    costs[(group_index + 1, end)] = (cost, breaks + [end])
+
+    break_positions = costs[(group_count, len(words))][1][:-1]
     groups: list[list] = []
-    current_group: list = []
-    for word in words:
-        current_group.append(word)
+    start = 0
+    for end in break_positions + [len(words)]:
+        groups.append(words[start:end])
+        start = end
+    return groups
+
+
+def split_caption_word_groups(words, target_words: int) -> list[list]:
+    """Split on commas and long pauses, then balance the remaining phrases."""
+    groups: list[list] = []
+    phrase: list = []
+    for index, word in enumerate(words):
+        phrase.append(word)
         word_text = clean_text(getattr(word, "word", ""))
-        if word_ends_with_comma(word_text) or len(current_group) >= max_words:
-            groups.append(current_group)
-            current_group = []
-    if current_group:
-        groups.append(current_group)
+        next_word = words[index + 1] if index + 1 < len(words) else None
+        pause_after_word = (
+            next_word is not None
+            and next_word.start - word.end >= LONG_WORD_PAUSE_SECONDS
+            and not is_connector(word_text)
+        )
+        if word_ends_with_comma(word_text) or pause_after_word:
+            groups.extend(split_balanced_group(phrase, target_words))
+            phrase = []
+    if phrase:
+        groups.extend(split_balanced_group(phrase, target_words))
     return groups
 
 
@@ -153,11 +212,11 @@ class WhisperSrtApp(tk.Tk):
             row=6, column=2, sticky="w", padx=(12, 0), pady=4
         )
 
-        ttk.Label(frame, text="Maks. s\u0142\u00f3w w napisie:").grid(row=7, column=0, sticky="w", pady=4)
+        ttk.Label(frame, text="Docelowo s\u0142\u00f3w w kafelku:").grid(row=7, column=0, sticky="w", pady=4)
         ttk.Spinbox(frame, from_=1, to=30, textvariable=self.max_words, width=14).grid(
             row=7, column=1, sticky="w", pady=4
         )
-        ttk.Label(frame, text="Domy\u015blnie 7; przecinek tworzy nowy napis i znika na jego ko\u0144cu").grid(
+        ttk.Label(frame, text="Domy\u015blnie 7; przecinek i d\u0142u\u017csza pauza tworz\u0105 nowy kafelek").grid(
             row=7, column=2, sticky="w", padx=(12, 0), pady=4
         )
 
@@ -198,7 +257,7 @@ class WhisperSrtApp(tk.Tk):
         except tk.TclError:
             max_words = 0
         if not 1 <= max_words <= 30:
-            messagebox.showerror("Nieprawid\u0142owy limit", "Podaj liczb\u0119 od 1 do 30 s\u0142\u00f3w w wierszu.")
+            messagebox.showerror("Nieprawid\u0142owy limit", "Podaj liczb\u0119 od 1 do 30 docelowych s\u0142\u00f3w w kafelku.")
             return
         self.start_button.configure(state="disabled")
         self.progress.start(12)
