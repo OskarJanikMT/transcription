@@ -19,8 +19,9 @@ MEDIA_TYPES = (
 )
 MODELS = ("tiny", "base", "small", "medium", "large-v3")
 CUDA_DLL_DIRECTORIES = []
-LONG_WORD_PAUSE_SECONDS = 0.65
+LONG_WORD_PAUSE_SECONDS = 0.4
 SHORT_TILE_MAX_DURATION_EXTENSION = 0.25
+ALL_TILES_MAX_DURATION_EXTENSION = 0.5
 NUMBER_PATTERN = re.compile(r"^[+-]?\d+(?:[.,]\d+)?(?:%|°)?[.)]?$")
 UNIT_WORDS = frozenset(
     {
@@ -160,7 +161,9 @@ def split_balanced_group(words, target_words: int, max_words: int, max_chars: in
     return best_partition[1] if best_partition else [words]
 
 
-def split_caption_word_groups(words, target_words: int, max_words: int, max_chars: int) -> list[list]:
+def split_caption_word_groups(
+    words, target_words: int, max_words: int, max_chars: int, pause_seconds: float
+) -> list[list]:
     """Split on commas, numbers and long pauses, then balance phrases."""
     groups: list[list] = []
     phrase: list = []
@@ -173,7 +176,7 @@ def split_caption_word_groups(words, target_words: int, max_words: int, max_char
         next_word = words[index + 1] if index + 1 < len(words) else None
         pause_after_word = (
             next_word is not None
-            and next_word.start - word.end >= LONG_WORD_PAUSE_SECONDS
+            and next_word.start - word.end >= pause_seconds
             and not is_connector(word_text)
         )
         if word_ends_with_comma(word_text) or pause_after_word:
@@ -197,12 +200,22 @@ def extend_short_tile_durations(entries, max_chars: int) -> None:
             entries[index] = (start, extended_end, text)
 
 
+def extend_all_tile_durations(entries) -> None:
+    """Extend every tile into the available gap without moving its start."""
+    for index, (start, end, text) in enumerate(entries):
+        next_start = entries[index + 1][0] if index + 1 < len(entries) else end + ALL_TILES_MAX_DURATION_EXTENSION
+        extended_end = min(end + ALL_TILES_MAX_DURATION_EXTENSION, next_start - 0.01)
+        if extended_end > end:
+            entries[index] = (start, extended_end, text)
+
+
 def write_srt(
     segments,
     destination: Path,
     target_words: int = 7,
     max_words: int = 10,
     max_chars: int = 42,
+    pause_seconds: float = LONG_WORD_PAUSE_SECONDS,
 ) -> int:
     """Create a UTF-8 SRT file from faster-whisper segments."""
     entries: list[tuple[float, float, str]] = []
@@ -210,7 +223,9 @@ def write_srt(
         word_timestamps = list(getattr(segment, "words", None) or [])
         if not word_timestamps:
             continue
-        for group in split_caption_word_groups(word_timestamps, target_words, max_words, max_chars):
+        for group in split_caption_word_groups(
+            word_timestamps, target_words, max_words, max_chars, pause_seconds
+        ):
             text_words = [clean_text(word.word) for word in group]
             text_words[-1] = remove_final_comma(text_words[-1])
             text = " ".join(word for word in text_words if word)
@@ -218,6 +233,7 @@ def write_srt(
                 entries.append((group[0].start, group[-1].end, text))
 
     extend_short_tile_durations(entries, max_chars)
+    extend_all_tile_durations(entries)
     with destination.open("w", encoding="utf-8-sig", newline="\n") as file:
         for index, (start, end, text) in enumerate(entries, start=1):
             file.write(f"{index}\n{srt_time(start)} --> {srt_time(end)}\n{text}\n\n")
@@ -228,8 +244,8 @@ class WhisperSrtApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Napisy do Premiere — Whisper → SRT")
-        self.geometry("720x580")
-        self.minsize(640, 540)
+        self.geometry("720x630")
+        self.minsize(640, 590)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.input_path = tk.StringVar()
         self.output_path = tk.StringVar()
@@ -238,6 +254,7 @@ class WhisperSrtApp(tk.Tk):
         self.target_words = tk.IntVar(value=7)
         self.max_words = tk.IntVar(value=10)
         self.max_chars = tk.IntVar(value=42)
+        self.pause_seconds = tk.DoubleVar(value=LONG_WORD_PAUSE_SECONDS)
         # CPU works out of the box. CUDA requires matching NVIDIA CUDA libraries.
         self.device = tk.StringVar(value="cpu")
         self.status = tk.StringVar(value="Wybierz nagranie, aby rozpocząć.")
@@ -309,11 +326,19 @@ class WhisperSrtApp(tk.Tk):
             row=9, column=2, sticky="w", padx=(12, 0), pady=4
         )
 
+        ttk.Label(frame, text="Pauza dzieląca kafelki (s):").grid(row=10, column=0, sticky="w", pady=4)
+        ttk.Spinbox(
+            frame, from_=0.1, to=5.0, increment=0.05, textvariable=self.pause_seconds, width=14
+        ).grid(row=10, column=1, sticky="w", pady=4)
+        ttk.Label(frame, text="Domyślnie 0,40 s; liczona między słowami").grid(
+            row=10, column=2, sticky="w", padx=(12, 0), pady=4
+        )
+
         self.progress = ttk.Progressbar(frame, mode="indeterminate")
-        self.progress.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(25, 8))
-        ttk.Label(frame, textvariable=self.status, wraplength=650).grid(row=11, column=0, columnspan=3, sticky="w")
+        self.progress.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(25, 8))
+        ttk.Label(frame, textvariable=self.status, wraplength=650).grid(row=12, column=0, columnspan=3, sticky="w")
         self.start_button = ttk.Button(frame, text="Generuj napisy SRT", command=self.start)
-        self.start_button.grid(row=12, column=0, columnspan=3, pady=(20, 0))
+        self.start_button.grid(row=13, column=0, columnspan=3, pady=(20, 0))
 
     @staticmethod
     def _path_row(parent, row, label, variable, command, button) -> None:
@@ -345,14 +370,20 @@ class WhisperSrtApp(tk.Tk):
             target_words = self.target_words.get()
             max_words = self.max_words.get()
             max_chars = self.max_chars.get()
+            pause_seconds = self.pause_seconds.get()
         except tk.TclError:
             target_words = 0
             max_words = 0
             max_chars = 0
-        if not 1 <= target_words <= max_words <= 30 or not 8 <= max_chars <= 160:
+            pause_seconds = 0
+        if (
+            not 1 <= target_words <= max_words <= 30
+            or not 8 <= max_chars <= 160
+            or not 0.1 <= pause_seconds <= 5.0
+        ):
             messagebox.showerror(
                 "Nieprawidłowe ustawienia",
-                "Docelowa liczba słów musi wynosić od 1 do maksimum (do 30), a limit znaków od 8 do 160.",
+                "Docelowa liczba słów musi wynosić od 1 do maksimum (do 30), limit znaków od 8 do 160, a pauza od 0,10 do 5 s.",
             )
             return
         self.start_button.configure(state="disabled")
@@ -360,12 +391,18 @@ class WhisperSrtApp(tk.Tk):
         self.status.set("Uruchamianie Whispera — pierwsze użycie może pobrać model…")
         threading.Thread(
             target=self._transcribe,
-            args=(source, output, target_words, max_words, max_chars),
+            args=(source, output, target_words, max_words, max_chars, pause_seconds),
             daemon=True,
         ).start()
 
     def _transcribe(
-        self, source: Path, output: Path, target_words: int, max_words: int, max_chars: int
+        self,
+        source: Path,
+        output: Path,
+        target_words: int,
+        max_words: int,
+        max_chars: int,
+        pause_seconds: float,
     ) -> None:
         try:
             requested_device = self.device.get()
@@ -393,6 +430,7 @@ class WhisperSrtApp(tk.Tk):
                 target_words=target_words,
                 max_words=max_words,
                 max_chars=max_chars,
+                pause_seconds=pause_seconds,
             )
             detected = getattr(info, "language", "nieznany")
             self.events.put(("done", (count, output, detected)))
